@@ -1,6 +1,6 @@
 // Sokoban solver for make.fun sokoban-solver-01
-// Full A* search over (player, boxes) states with binary heap.
-// Time-boxed per level: larger levels get more time.
+// Full A* for small levels, greedy per-box fallback for larger levels.
+// Memory-efficient to avoid exit code 134 (SIGABRT).
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -37,36 +37,46 @@ function parse(text: string) {
   return { w, h, wall, goals, boxes, player };
 }
 
+function manhattan(a: number, b: number, w: number): number {
+  return Math.abs((a % w) - (b % w)) + Math.abs(Math.floor(a / w) - Math.floor(b / w));
+}
+
 function nearestGoalDist(b: number, goals: number[], w: number): number {
   let best = Infinity;
-  for (const g of goals) best = Math.min(best, Math.abs((b % w) - (g % w)) + Math.abs(Math.floor(b / w) - Math.floor(g / w)));
+  for (const g of goals) best = Math.min(best, manhattan(b, g, w));
   return best;
 }
 
-function isDeadlock(boxes: number[], wall: boolean[], goals: number[], w: number, h: number): boolean {
+// Simulate moves to verify legality and completion.
+function simulate(text: string, moves: string): { legal: boolean; solved: boolean } {
+  const { w, h, wall, goals, boxes, player: initialPlayer } = parse(text);
   const goalSet = new Set(goals);
-  const boxSet = new Set(boxes);
-  for (const b of boxes) {
-    if (goalSet.has(b)) continue;
-    const x = b % w, y = Math.floor(b / w);
-    const upWall = y === 0 || wall[b - w];
-    const downWall = y === h - 1 || wall[b + w];
-    const leftWall = x === 0 || wall[b - 1];
-    const rightWall = x === w - 1 || wall[b + 1];
-    if ((upWall && leftWall) || (upWall && rightWall) || (downWall && leftWall) || (downWall && rightWall)) return true;
-    if ((upWall || downWall) && ((x > 0 && boxSet.has(b - 1)) || (x < w - 1 && boxSet.has(b + 1)))) {
-      const adj = (x > 0 && boxSet.has(b - 1)) ? b - 1 : b + 1;
-      const ax = adj % w, ay = Math.floor(adj / w);
-      const au = ay === 0 || wall[ay * w + ax - w];
-      const ad = ay === h - 1 || wall[ay * w + ax + w];
-      const al = ax === 0 || wall[ay * w + ax - 1];
-      const ar = ax === w - 1 || wall[ay * w + ax + 1];
-      if ((au && al) || (au && ar) || (ad && al) || (ad && ar)) return true;
+  let player = initialPlayer;
+  let bs = [...boxes];
+  for (const ch of moves) {
+    const dir = DIRS.find((d) => d[2] === ch.toLowerCase());
+    if (!dir) return { legal: false, solved: false };
+    const [dx, dy] = dir;
+    const d = dy * w + dx;
+    const q = player + d;
+    if (q < 0 || q >= w * h || wall[q]) return { legal: false, solved: false };
+    let nb: number[];
+    if (bs.includes(q)) {
+      const nq = q + d;
+      if (nq < 0 || nq >= w * h || wall[nq] || bs.includes(nq)) return { legal: false, solved: false };
+      nb = bs.slice();
+      nb[nb.indexOf(q)] = nq;
+      nb.sort((a, b) => a - b);
+    } else {
+      nb = bs;
     }
+    player = q;
+    bs = nb;
   }
-  return false;
+  return { legal: true, solved: bs.every((b) => goalSet.has(b)) };
 }
 
+// A* full search for small levels.
 class Heap {
   private a: [number, number, number, number][] = [];
   push(f: number, g: number, p: number, b: number) {
@@ -102,7 +112,7 @@ class Heap {
   get size(): number { return this.a.length; }
 }
 
-function solve(text: string, timeLimitMs: number): string {
+function solveAstar(text: string, timeLimitMs: number, maxExpansions: number): string | null {
   const { w, h, wall, goals, boxes: initialBoxes, player: initialPlayer } = parse(text);
   const goalSet = new Set(goals);
   if (initialBoxes.every((b) => goalSet.has(b))) return '';
@@ -119,11 +129,10 @@ function solve(text: string, timeLimitMs: number): string {
   closed.add(`${initialPlayer}|${initialBoxes.join(',')}`);
 
   let expanded = 0;
-  const MAX_EXPANSIONS = 5_000_000;
   const startTime = Date.now();
 
   while (open.size > 0) {
-    if (Date.now() - startTime > timeLimitMs) return '';
+    if (Date.now() - startTime > timeLimitMs) return null;
 
     const top = open.pop();
     if (!top) break;
@@ -134,7 +143,7 @@ function solve(text: string, timeLimitMs: number): string {
     if (bs.every((b) => goalSet.has(b))) return mvss[bIdx];
 
     expanded++;
-    if (expanded > MAX_EXPANSIONS) return '';
+    if (expanded > maxExpansions) return null;
 
     for (const [dx, dy, letter] of DIRS) {
       const d = dy * w + dx;
@@ -169,37 +178,174 @@ function solve(text: string, timeLimitMs: number): string {
     }
   }
 
+  return null;
+}
+
+function isDeadlock(boxes: number[], wall: boolean[], goals: number[], w: number, h: number): boolean {
+  const goalSet = new Set(goals);
+  const boxSet = new Set(boxes);
+  for (const b of boxes) {
+    if (goalSet.has(b)) continue;
+    const x = b % w, y = Math.floor(b / w);
+    const upWall = y === 0 || wall[b - w];
+    const downWall = y === h - 1 || wall[b + w];
+    const leftWall = x === 0 || wall[b - 1];
+    const rightWall = x === w - 1 || wall[b + 1];
+    if ((upWall && leftWall) || (upWall && rightWall) || (downWall && leftWall) || (downWall && rightWall)) return true;
+    if ((upWall || downWall) && ((x > 0 && boxSet.has(b - 1)) || (x < w - 1 && boxSet.has(b + 1)))) {
+      const adj = (x > 0 && boxSet.has(b - 1)) ? b - 1 : b + 1;
+      const ax = adj % w, ay = Math.floor(adj / w);
+      const au = ay === 0 || wall[ay * w + ax - w];
+      const ad = ay === h - 1 || wall[ay * w + ax + w];
+      const al = ax === 0 || wall[ay * w + ax - 1];
+      const ar = ax === w - 1 || wall[ay * w + ax + 1];
+      if ((au && al) || (au && ar) || (ad && al) || (ad && ar)) return true;
+    }
+  }
+  return false;
+}
+
+// Greedy per-box solver: push each box to nearest unclaimed goal.
+// Used as fallback when A* can't solve within limits.
+function pushBoxToGoal(player: number, box: number, goal: number, allBoxes: number[], wall: boolean[], goals: number[], w: number, h: number): { moves: string; player: number } | null {
+  const goalSet = new Set(goals);
+  const hEst = (p: number, b: number): number => manhattan(b, goal, w) + manhattan(p, b, w);
+
+  const open: [number, number, number, number][] = [];
+  const closed = new Set<string>();
+  const parents: Map<string, [number, number, string]> = new Map();
+
+  open.push([hEst(player, box), 0, player, box]);
+  closed.add(`${player}|${box}`);
+
+  const MAX_EXP = 30_000;
+  let expanded = 0;
+
+  while (open.length > 0) {
+    let bi = 0;
+    for (let i = 1; i < open.length; i++) {
+      if (open[i][0] < open[bi][0] || (open[i][0] === open[bi][0] && open[i][1] < open[bi][1])) bi = i;
+    }
+    const [f, g, p, b] = open.splice(bi, 1)[0]!;
+
+    if (b === goal) {
+      let moves = '';
+      let cur: [number, number] | null = [p, b];
+      while (cur) {
+        const par = parents.get(`${cur[0]}|${cur[1]}`);
+        if (!par) break;
+        moves = par[2] + moves;
+        cur = [par[0], par[1]];
+      }
+      return { moves, player: p };
+    }
+
+    expanded++;
+    if (expanded > MAX_EXP) return null;
+
+    const otherBoxes = new Set(allBoxes.filter((x) => x !== b));
+
+    for (const [dx, dy, letter] of DIRS) {
+      const d = dy * w + dx;
+      const q = p + d;
+      if (q < 0 || q >= w * h || wall[q] || otherBoxes.has(q)) continue;
+
+      let np = q, nb = b, move = letter;
+      if (q === b) {
+        const nq = q + d;
+        if (nq < 0 || nq >= w * h || wall[nq] || otherBoxes.has(nq)) continue;
+        nb = nq;
+        move = letter.toUpperCase();
+      }
+
+      const k = `${np}|${nb}`;
+      if (closed.has(k)) continue;
+
+      const nx = nb % w, ny = Math.floor(nb / w);
+      if (!goalSet.has(nb)) {
+        const uw = ny === 0 || wall[nb - w];
+        const dw = ny === h - 1 || wall[nb + w];
+        const lw = nx === 0 || wall[nb - 1];
+        const rw = nx === w - 1 || wall[nb + 1];
+        if ((uw && lw) || (uw && rw) || (dw && lw) || (dw && rw)) continue;
+      }
+
+      closed.add(k);
+      parents.set(k, [p, b, move]);
+      open.push([g + 1 + hEst(np, nb), g + 1, np, nb]);
+    }
+  }
+
+  return null;
+}
+
+function solveGreedy(text: string): string | null {
+  const { w, h, wall, goals, boxes: initialBoxes, player: initialPlayer } = parse(text);
+  const goalSet = new Set(goals);
+  const unclaimedGoals = [...goals];
+  let boxes = [...initialBoxes];
+  let player = initialPlayer;
+  let allMoves = '';
+
+  let progress = true;
+  while (progress && unclaimedGoals.length > 0) {
+    progress = false;
+    boxes.sort((a, b) => manhattan(player, a, w) - manhattan(player, b, w));
+
+    for (const box of boxes) {
+      if (goalSet.has(box)) continue;
+
+      let bestGoal = -1, bestDist = Infinity;
+      for (const g of unclaimedGoals) {
+        const d = manhattan(box, g, w);
+        if (d < bestDist) { bestDist = d; bestGoal = g; }
+      }
+      if (bestGoal < 0) break;
+
+      const result = pushBoxToGoal(player, box, bestGoal, boxes, wall, goals, w, h);
+      if (!result) continue;
+
+      allMoves += result.moves;
+      player = result.player;
+      boxes = boxes.map(b => b === box ? bestGoal : b);
+      unclaimedGoals.splice(unclaimedGoals.indexOf(bestGoal), 1);
+      progress = true;
+      break;
+    }
+  }
+
+  const check = simulate(text, allMoves);
+  if (!check.legal || !check.solved) return null;
+  return allMoves;
+}
+
+function solve(text: string): string {
+  const { w, h, wall, goals, boxes: initialBoxes, player: initialPlayer } = parse(text);
+  const goalSet = new Set(goals);
+  if (initialBoxes.every((b) => goalSet.has(b))) return '';
+
+  const boxCount = initialBoxes.length;
+  // Use A* for small levels, greedy for larger ones
+  if (boxCount <= 5) {
+    const result = solveAstar(text, boxCount <= 4 ? 25_000 : 20_000, boxCount <= 4 ? 800_000 : 500_000);
+    if (result !== null) return result;
+  }
+
+  // Fallback to greedy per-box
+  const greedy = solveGreedy(text);
+  if (greedy !== null) return greedy;
+
+  // If greedy failed, try A* with more time as last resort
+  if (boxCount > 5) {
+    const result = solveAstar(text, boxCount <= 8 ? 30_000 : 20_000, boxCount <= 8 ? 1_000_000 : 400_000);
+    if (result !== null) return result;
+  }
+
   return '';
 }
 
-function countBoxes(text: string): number {
-  let count = 0;
-  for (const ch of text) {
-    if (ch === '$' || ch === '*') count++;
-  }
-  return count;
-}
-
-const allIds = readdirSync(I).sort();
-const totalTimeMs = 50_000; // 50 seconds total
-let timeUsed = 0;
-
-for (const id of allIds) {
-  const text = readFileSync(join(I, id, 'level.txt'), 'utf8');
-  const boxCount = countBoxes(text);
-  // Allocate time based on box count: more boxes = more time
-  let levelTimeMs = 5_000 + boxCount * 2_000;
-  if (levelTimeMs > 20_000) levelTimeMs = 20_000;
-  // Don't exceed remaining time
-  const remaining = totalTimeMs - timeUsed;
-  if (remaining <= 1_000) break;
-  if (levelTimeMs > remaining) levelTimeMs = remaining;
-
-  const t0 = Date.now();
-  const moves = solve(text, levelTimeMs);
-  const elapsed = Date.now() - t0;
-  timeUsed += elapsed;
-
+for (const id of readdirSync(I).sort()) {
+  const moves = solve(readFileSync(join(I, id, 'level.txt'), 'utf8'));
   mkdirSync(join(O, id), { recursive: true });
   writeFileSync(join(O, id, 'solution.txt'), `${moves}\n`);
 }
