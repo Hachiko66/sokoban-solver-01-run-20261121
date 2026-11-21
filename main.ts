@@ -325,21 +325,15 @@ function solve(text: string): string {
   if (initialBoxes.every((b) => goalSet.has(b))) return '';
 
   const boxCount = initialBoxes.length;
-  // Use A* for small levels, greedy for larger ones
-  if (boxCount <= 5) {
+  // Full A* for small levels only - memory bounded to avoid crash
+  if (boxCount <= 6) {
     const result = solveAstar(text, boxCount <= 4 ? 25_000 : 20_000, boxCount <= 4 ? 800_000 : 500_000);
     if (result !== null) return result;
   }
 
-  // Fallback to greedy per-box
+  // Greedy per-box fallback for larger levels
   const greedy = solveGreedy(text);
   if (greedy !== null) return greedy;
-
-  // If greedy failed, try A* with more time as last resort
-  if (boxCount > 5) {
-    const result = solveAstar(text, boxCount <= 8 ? 30_000 : 20_000, boxCount <= 8 ? 1_000_000 : 400_000);
-    if (result !== null) return result;
-  }
 
   return '';
 }
